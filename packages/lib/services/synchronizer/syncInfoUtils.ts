@@ -1,0 +1,728 @@
+import Logger from '@joplin/utils/Logger';
+import { FileApi } from '../../file-api';
+import JoplinDatabase from '../../JoplinDatabase';
+import Setting from '../../models/Setting';
+import BaseItem from '../../models/BaseItem';
+import { State } from '../../reducer';
+import { PublicPrivateKeyPair } from '../e2ee/ppk/ppk';
+import { MasterKeyEntity } from '../e2ee/types';
+import { compareVersions } from 'compare-versions';
+import { _ } from '../../locale';
+import JoplinError from '../../JoplinError';
+import { ErrorCode } from '../../errors';
+import fastDeepEqual = require('fast-deep-equal');
+import { createSelector } from 'reselect';
+import isNoteLockEnabled from '../noteLock/isNoteLockEnabled';
+
+const logger = Logger.create('syncInfoUtils');
+
+export interface SyncInfoValueBoolean {
+	value: boolean;
+	updatedTime: number;
+}
+
+export interface SyncInfoValueString {
+	value: string;
+	updatedTime: number;
+}
+
+export interface SyncInfoValueInt {
+	value: number;
+	updatedTime: number;
+}
+
+export interface SyncInfoValuePublicPrivateKeyPair {
+	value: PublicPrivateKeyPair;
+	updatedTime: number;
+}
+
+export interface MergeSyncInfosOptions {
+	resetPropagates?: boolean;
+	hasLocalLockedNotes?: boolean;
+}
+
+// The sync target's note lock key and sync migration id, parked while a sync is stopped on a conflict.
+export interface NoteLockKeyConflict {
+	noteLockKey: MasterKeyEntity;
+	syncMigrationId: string;
+}
+
+// This should be set to the client version whenever we require all the clients to be at the same
+// version in order to synchronise. One example is when adding support for the trash feature - if an
+// old client that doesn't know about this feature synchronises data with a new client, the notes
+// will no longer be deleted on the old client.
+//
+// Usually this variable should be bumped whenever we add properties to a sync item.
+//
+// `appMinVersion_` should really just be a constant but for testing purposes it can be changed
+// using `setAppMinVersion()`
+let appMinVersion_ = '3.7.0';
+
+export const setAppMinVersion = (v: string) => {
+	const previous = appMinVersion_;
+	appMinVersion_ = v;
+
+	return {
+		reset: () => {
+			appMinVersion_ = previous;
+		},
+	};
+};
+
+// 2026-07-10: Joplin 3.6 now supports the Joplin 3.7.0 sync format. This allows the 3.6 stable release
+// to sync with clients that have been upgraded to Joplin 3.7.
+const forwardCompatibleAppMinVersion = '3.7.0';
+
+
+export function onRevisionServiceSettingsChanged(key: string, value: unknown) {
+	if (key !== 'revisionService.enabled' && key !== 'revisionService.ttlDays') return;
+	const s = localSyncInfo();
+	let changed = false;
+	if (key === 'revisionService.enabled' && s.revisionServiceEnabled !== value) {
+		if (typeof value !== 'boolean') return;
+		s.revisionServiceEnabled = value;
+		changed = true;
+	}
+	if (key === 'revisionService.ttlDays' && s.revisionServiceTtlDays !== value) {
+		if (typeof value !== 'number') return;
+		s.revisionServiceTtlDays = value;
+		changed = true;
+	}
+	if (changed) saveLocalSyncInfo(s);
+}
+
+export async function migrateLocalSyncInfo(db: JoplinDatabase) {
+	if (Setting.value('syncInfoCache')) return; // Already initialized
+
+	// TODO: if the sync info is changed, there should be steps to migrate from
+	// v3 to v4, v4 to v5, etc.
+
+	const masterKeys: MasterKeyEntity[] = await db.selectAll('SELECT * FROM master_keys');
+
+	const masterKeyMap: Record<string, MasterKeyEntity> = {};
+	for (const mk of masterKeys) masterKeyMap[mk.id] = mk;
+
+	const syncInfo = new SyncInfo();
+	syncInfo.version = Setting.value('syncVersion');
+	syncInfo.e2ee = Setting.valueNoThrow('encryption.enabled', false);
+	syncInfo.activeMasterKeyId = Setting.valueNoThrow('encryption.activeMasterKeyId', '');
+	syncInfo.masterKeys = masterKeys;
+
+	// We set the timestamp to 0 because we don't know when the source setting
+	// has been set. That way, if the parameter is changed later on in any
+	// client, the new value will have higher priority. This is to handle this
+	// case:
+	//
+	// - Client 1 upgrade local sync target info (with E2EE = false)
+	// - Client 1 set E2EE to true
+	// - Client 2 upgrade local sync target info (with E2EE = false)
+	// - => If we don't set the timestamp to 0, the local value of client 2 will
+	//   have a higher timestamp and E2EE will get disabled, even though this is
+	//   most likely not what the user wants.
+	syncInfo.setKeyTimestamp('e2ee', 0);
+	syncInfo.setKeyTimestamp('activeMasterKeyId', 0);
+
+	// For revisionService.*: stamp the timestamp only when the local value
+	// has been customised. A default value uploaded with a real timestamp
+	// would overwrite another client's customised value on first sync.
+	const localRevisionEnabled = Setting.value('revisionService.enabled');
+	const localRevisionTtlDays = Setting.value('revisionService.ttlDays');
+	syncInfo.revisionServiceEnabled = localRevisionEnabled;
+	syncInfo.revisionServiceTtlDays = localRevisionTtlDays;
+	syncInfo.setKeyTimestamp('revisionServiceEnabled', localRevisionEnabled === Setting.settingMetadata('revisionService.enabled').value ? 0 : Date.now());
+	syncInfo.setKeyTimestamp('revisionServiceTtlDays', localRevisionTtlDays === Setting.settingMetadata('revisionService.ttlDays').value ? 0 : Date.now());
+
+	await saveLocalSyncInfo(syncInfo);
+}
+
+export async function uploadSyncInfo(api: FileApi, syncInfo: SyncInfo) {
+	await api.put('info.json', syncInfo.serialize());
+}
+
+export async function fetchSyncInfo(api: FileApi): Promise<SyncInfo> {
+	const syncTargetInfoText = await api.get('info.json');
+
+	// Returns version 0 if the sync target is empty
+	let output: { version: number; [key: string]: unknown } = { version: 0 };
+
+	if (syncTargetInfoText) {
+		output = JSON.parse(syncTargetInfoText);
+		if (!output.version) throw new Error('Missing "version" field in info.json');
+	} else {
+		// If info.json is not present, this might be an old sync target, in
+		// which case we can at least get the version number from version.txt
+		const oldVersion = await api.get('.sync/version.txt');
+
+		// Where info.json is missing, but .sync/version.txt is not, the sync target will be set as needing upgrade, and will be upgraded upon restarting the app
+		// If both info.json and .sync/version.txt are missing, it can be assumed that something has gone wrong with the sync target, so do not mark as needing upgrade and raise a failsafe error if not the initial sync
+		// When performing 'Delete local data and re-download from sync target' or 'Re-upload local data to sync target' actions, all sync_items are cleared down as if it were the initial sync
+		if (oldVersion) {
+			output = { version: 1 };
+		} else if (!(await isInitialSync(api.syncTargetId()))) {
+			throwFailsafeError();
+		}
+	}
+
+	return fixSyncInfo(new SyncInfo(JSON.stringify(output)));
+}
+
+export async function checkSyncTargetIsValid(api: FileApi): Promise<void> {
+	const syncTargetInfoText = await api.get('info.json');
+
+	if (!syncTargetInfoText) {
+		throwFailsafeError();
+	}
+}
+
+async function isInitialSync(syncTargetId: number) {
+	const syncedItems = await BaseItem.syncedItemIds(syncTargetId);
+	return syncedItems.length === 0;
+}
+
+// This failsafe validation producing this error will be performed regardless of which sync target is selected
+// Other failsafe validation is performed based on the percentage of items deleted in the "basicDelta" function
+// The basicDelta is not executed for all sync target types, but the validation in this function is superior at protecting against data loss
+// However it is still beneficial to keep the failsafe check which is driven by count of deleted items in place, as it can protect against deliberate deletion of all notes by the user,
+// where they are not aware of the implications of 2 way sync. This is just "nice to have" though, so would not be worth adding complexity to make it work for all sync target types
+function throwFailsafeError() {
+	if (Setting.value('sync.wipeOutFailSafe')) {
+		throw new JoplinError(_('Fail-safe: Sync was interrupted to prevent data loss, because the sync target is empty or damaged. To override this behaviour disable the fail-safe in the sync settings.'), 'failSafe');
+	}
+}
+
+export function saveLocalSyncInfo(syncInfo: SyncInfo) {
+	Setting.setValue('syncInfoCache', syncInfo.serialize());
+}
+
+const fixSyncInfo = (syncInfo: SyncInfo) => {
+	if (syncInfo.activeMasterKeyId) {
+		if (!syncInfo.masterKeys || !syncInfo.masterKeys.find(mk => mk.id === syncInfo.activeMasterKeyId)) {
+			logger.warn(`Sync info is using a non-existent key as the active key - clearing it: ${syncInfo.activeMasterKeyId}`);
+			syncInfo.activeMasterKeyId = '';
+		}
+	}
+	return syncInfo;
+};
+
+export function localSyncInfo(): SyncInfo {
+	const output = new SyncInfo(Setting.value('syncInfoCache'));
+	// Avoid resetting appMinVersion when operating in forward-compatibility mode. This avoids data loss if the user
+	// switches sync targets (v3.7.0 sync targets contain properties/data unsupported by most older Joplin versions)
+	if (output.appMinVersion !== forwardCompatibleAppMinVersion || compareVersions(appMinVersion_, forwardCompatibleAppMinVersion) > 0) {
+		output.appMinVersion = appMinVersion_;
+	}
+	return fixSyncInfo(output);
+}
+
+export function localSyncInfoFromState(state: State): SyncInfo {
+	return new SyncInfo(state.settings['syncInfoCache']);
+}
+
+// Creating SyncInfo also recreates nested values such as masterKeys. This selector keeps
+// the result referentially stable while syncInfoCache is unchanged, so React hook dependencies
+// do not restart asynchronous work in response to unrelated Redux updates.
+export const localSyncInfoSelector = createSelector(
+	(state: State) => state.settings['syncInfoCache'],
+	cache => new SyncInfo(cache),
+);
+
+// When deciding which master key should be active we should take into account
+// whether it's been used or not. If it's been used before it should most likely
+// remain the active one, regardless of timestamps. This is because the extra
+// key was most likely created by mistake by the user, in particular in this
+// kind of scenario:
+//
+// - Client 1 setup sync with sync target
+// - Client 1 enable encryption
+// - Client 1 sync
+//
+// Then user 2 does the same:
+//
+// - Client 2 setup sync with sync target
+// - Client 2 enable encryption
+// - Client 2 sync
+//
+// The problem is that enabling encryption was not needed since it was already
+// done (and recorded in info.json) on the sync target. As a result an extra key
+// has been created and it has been set as the active one, but we shouldn't use
+// it. Instead the key created by client 1 should be used and made active again.
+//
+// And we can do this using the "hasBeenUsed" field which tells us which keys
+// has already been used to encrypt data. In this case, at the moment we compare
+// local and remote sync info (before synchronising the data), key1.hasBeenUsed
+// is true, but key2.hasBeenUsed is false.
+//
+// 2023-05-30: Additionally, if one key is enabled and the other is not, we
+// always pick the enabled one regardless of usage.
+const mergeActiveMasterKeys = (s1: SyncInfo, s2: SyncInfo, output: SyncInfo) => {
+	const activeMasterKey1 = getActiveMasterKey(s1);
+	const activeMasterKey2 = getActiveMasterKey(s2);
+	let doDefaultAction = false;
+
+	if (activeMasterKey1 && activeMasterKey2) {
+		if (masterKeyEnabled(activeMasterKey1) && !masterKeyEnabled(activeMasterKey2)) {
+			output.setWithTimestamp(s1, 'activeMasterKeyId');
+		} else if (!masterKeyEnabled(activeMasterKey1) && masterKeyEnabled(activeMasterKey2)) {
+			output.setWithTimestamp(s2, 'activeMasterKeyId');
+		} else if (activeMasterKey1.hasBeenUsed && !activeMasterKey2.hasBeenUsed) {
+			output.setWithTimestamp(s1, 'activeMasterKeyId');
+		} else if (!activeMasterKey1.hasBeenUsed && activeMasterKey2.hasBeenUsed) {
+			output.setWithTimestamp(s2, 'activeMasterKeyId');
+		} else {
+			doDefaultAction = true;
+		}
+	} else {
+		doDefaultAction = true;
+	}
+
+	if (doDefaultAction) {
+		output.setWithTimestamp(s1.keyTimestamp('activeMasterKeyId') > s2.keyTimestamp('activeMasterKeyId') ? s1 : s2, 'activeMasterKeyId');
+	}
+};
+
+// If there is a distinction, s1 should be local sync info and s2 remote.
+export function mergeSyncInfos(s1: SyncInfo, s2: SyncInfo, options: MergeSyncInfosOptions = {}): SyncInfo {
+	const output: SyncInfo = new SyncInfo();
+
+	output.setWithTimestamp(s1.keyTimestamp('e2ee') > s2.keyTimestamp('e2ee') ? s1 : s2, 'e2ee');
+	output.setWithTimestamp(s1.keyTimestamp('ppk') > s2.keyTimestamp('ppk') ? s1 : s2, 'ppk');
+	output.setWithTimestamp(s1.keyTimestamp('revisionServiceEnabled') > s2.keyTimestamp('revisionServiceEnabled') ? s1 : s2, 'revisionServiceEnabled');
+	output.setWithTimestamp(s1.keyTimestamp('revisionServiceTtlDays') > s2.keyTimestamp('revisionServiceTtlDays') ? s1 : s2, 'revisionServiceTtlDays');
+	output.version = s1.version > s2.version ? s1.version : s2.version;
+
+	mergeActiveMasterKeys(s1, s2, output);
+
+	output.masterKeys = s1.masterKeys.slice();
+
+	for (const mk of s2.masterKeys) {
+		const idx = output.masterKeys.findIndex(m => m.id === mk.id);
+		if (idx < 0) {
+			output.masterKeys.push(mk);
+		} else {
+			const mk2 = output.masterKeys[idx];
+			output.masterKeys[idx] = mk.updated_time > mk2.updated_time ? mk : mk2;
+		}
+	}
+
+	let noteLockKeySource: SyncInfo;
+	if (!s2.noteLockKey) {
+		noteLockKeySource = s1;
+	} else if (!s1.noteLockKey) {
+		noteLockKeySource = s2;
+	} else if (s1.noteLockKey.id === s2.noteLockKey.id) {
+		noteLockKeySource = (s1.noteLockKey.updated_time || 0) >= (s2.noteLockKey.updated_time || 0) ? s1 : s2;
+	} else if (s1.syncMigrationId === s2.syncMigrationId) {
+		noteLockKeySource = options.resetPropagates ? s1 : s2;
+	} else if (!options.hasLocalLockedNotes) {
+		noteLockKeySource = s2;
+	} else {
+		// checkNoteLockKeyConflict() stops the sync before this point, so this only guards against a future caller skipping it.
+		throw new Error('Cannot merge a note lock key from a different lineage while local notes depend on the local key');
+	}
+	output.noteLockKey = noteLockKeySource.noteLockKey;
+	output.syncMigrationId = noteLockKeySource.syncMigrationId;
+
+	// We use >= so that the version from s1 (local) is preferred to the version in s2 (remote).
+	// For example, if s2 has appMinVersion 0.00 and s1 has appMinVersion 0.0.0, we choose the
+	// local version, 0.0.0.
+	output.appMinVersion = compareVersions(s1.appMinVersion, s2.appMinVersion) >= 0 ? s1.appMinVersion : s2.appMinVersion;
+
+	return output;
+}
+
+export function syncInfoEquals(s1: SyncInfo, s2: SyncInfo): boolean {
+	return fastDeepEqual(s1.toObject(), s2.toObject());
+}
+
+export class SyncInfo {
+
+	private version_ = 0;
+	private e2ee_: SyncInfoValueBoolean;
+	private activeMasterKeyId_: SyncInfoValueString;
+	private masterKeys_: MasterKeyEntity[] = [];
+	private noteLockKey_: MasterKeyEntity = null;
+	private syncMigrationId_ = '';
+	private ppk_: SyncInfoValuePublicPrivateKeyPair;
+	private appMinVersion_: string = appMinVersion_;
+	private revisionServiceEnabled_: SyncInfoValueBoolean;
+	private revisionServiceTtlDays_: SyncInfoValueInt;
+
+	public constructor(serialized: string = null) {
+		this.e2ee_ = { value: false, updatedTime: 0 };
+		this.activeMasterKeyId_ = { value: '', updatedTime: 0 };
+		this.ppk_ = { value: null, updatedTime: 0 };
+		this.revisionServiceEnabled_ = { value: true, updatedTime: 0 };
+		this.revisionServiceTtlDays_ = { value: 90, updatedTime: 0 };
+
+		if (serialized) this.load(serialized);
+	}
+
+	public toObject() {
+		return {
+			version: this.version,
+			e2ee: this.e2ee_,
+			activeMasterKeyId: this.activeMasterKeyId_,
+			masterKeys: this.masterKeys,
+			noteLockKey: this.noteLockKey,
+			syncMigrationId: this.syncMigrationId,
+			ppk: this.ppk_,
+			appMinVersion: this.appMinVersion,
+			revisionServiceEnabled: this.revisionServiceEnabled_,
+			revisionServiceTtlDays: this.revisionServiceTtlDays_,
+		};
+	}
+
+	public filterSyncInfo() {
+		const filtered = JSON.parse(JSON.stringify(this.toObject()));
+
+		// Filter content and checksum properties from master keys
+		if (filtered.masterKeys) {
+			filtered.masterKeys = filtered.masterKeys.map((mk: MasterKeyEntity) => {
+				delete mk.content;
+				delete mk.checksum;
+				return mk;
+			});
+		}
+
+		if (filtered.noteLockKey) {
+			delete filtered.noteLockKey.content;
+			delete filtered.noteLockKey.checksum;
+		}
+
+		// Truncate the private key and public key
+		if (filtered.ppk.value) {
+			filtered.ppk.value.privateKey.ciphertext = `${filtered.ppk.value.privateKey.ciphertext.substr(0, 20)}...${filtered.ppk.value.privateKey.ciphertext.substr(-20)}`;
+			filtered.ppk.value.publicKey = `${filtered.ppk.value.publicKey.substr(0, 40)}...`;
+		}
+		return filtered;
+	}
+
+	public serialize(): string {
+		return JSON.stringify(this.toObject(), null, '\t');
+	}
+
+	public load(serialized: string) {
+		// We probably should add validation after parsing at some point, but for now we are going to keep it simple
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Parsed JSON shape varies by sync target version (v0/v1/v2/v3 migrations); fields are validated per-field below via 'in' checks
+		let s: any = {};
+		try {
+			s = JSON.parse(serialized);
+		} catch (error) {
+			logger.error(`Error parsing sync info, using default values. Sync info: ${JSON.stringify(serialized)}`, error);
+		}
+		this.version = 'version' in s ? s.version : 0;
+		this.e2ee_ = 'e2ee' in s ? s.e2ee : { value: false, updatedTime: 0 };
+		this.activeMasterKeyId_ = 'activeMasterKeyId' in s ? s.activeMasterKeyId : { value: '', updatedTime: 0 };
+		this.masterKeys_ = 'masterKeys' in s ? s.masterKeys : [];
+		this.noteLockKey_ = 'noteLockKey' in s ? s.noteLockKey : null;
+		this.syncMigrationId_ = 'syncMigrationId' in s ? s.syncMigrationId : '';
+		this.ppk_ = 'ppk' in s ? s.ppk : { value: null, updatedTime: 0 };
+		this.appMinVersion_ = s.appMinVersion ? s.appMinVersion : '0.0.0';
+		this.revisionServiceEnabled_ = 'revisionServiceEnabled' in s ? s.revisionServiceEnabled : { value: true, updatedTime: 0 };
+		this.revisionServiceTtlDays_ = 'revisionServiceTtlDays' in s ? s.revisionServiceTtlDays : { value: 90, updatedTime: 0 };
+
+		// Migration for master keys that didn't have "hasBeenUsed" property -
+		// in that case we assume they've been used at least once.
+		for (const mk of this.masterKeys_) {
+			if (!('hasBeenUsed' in mk) || mk.hasBeenUsed === undefined) {
+				mk.hasBeenUsed = true;
+			}
+		}
+	}
+
+	public setWithTimestamp(fromSyncInfo: SyncInfo, propName: string) {
+		if (!(propName in (this as unknown as Record<string, unknown>))) throw new Error(`Invalid prop name: ${propName}`);
+
+		(this as unknown as Record<string, unknown>)[propName] = (fromSyncInfo as unknown as Record<string, unknown>)[propName];
+		this.setKeyTimestamp(propName, fromSyncInfo.keyTimestamp(propName));
+	}
+
+	public get version(): number {
+		return this.version_;
+	}
+
+	public set version(v: number) {
+		if (v === this.version_) return;
+
+		this.version_ = v;
+	}
+
+	public get ppk() {
+		return this.ppk_.value;
+	}
+
+	public set ppk(v: PublicPrivateKeyPair) {
+		if (v === this.ppk_.value) return;
+
+		this.ppk_ = { value: v, updatedTime: Date.now() };
+	}
+
+	public get e2ee(): boolean {
+		return this.e2ee_.value;
+	}
+
+	public set e2ee(v: boolean) {
+		if (v === this.e2ee) return;
+
+		this.e2ee_ = { value: v, updatedTime: Date.now() };
+	}
+
+	public get appMinVersion(): string {
+		return this.appMinVersion_;
+	}
+
+	public set appMinVersion(v: string) {
+		this.appMinVersion_ = v;
+	}
+
+	public get activeMasterKeyId(): string {
+		return this.activeMasterKeyId_.value;
+	}
+
+	public set activeMasterKeyId(v: string) {
+		if (v === this.activeMasterKeyId) return;
+
+		this.activeMasterKeyId_ = { value: v, updatedTime: Date.now() };
+	}
+
+	public get revisionServiceEnabled(): boolean {
+		return this.revisionServiceEnabled_.value;
+	}
+
+	public set revisionServiceEnabled(v: boolean) {
+		if (v === this.revisionServiceEnabled) return;
+
+		this.revisionServiceEnabled_ = { value: v, updatedTime: Date.now() };
+	}
+
+	public get revisionServiceTtlDays(): number {
+		return this.revisionServiceTtlDays_.value;
+	}
+
+	public set revisionServiceTtlDays(v: number) {
+		if (v === this.revisionServiceTtlDays) return;
+
+		this.revisionServiceTtlDays_ = { value: v, updatedTime: Date.now() };
+	}
+
+	public get masterKeys(): MasterKeyEntity[] {
+		return this.masterKeys_;
+	}
+
+	public set masterKeys(v: MasterKeyEntity[]) {
+		if (JSON.stringify(v) === JSON.stringify(this.masterKeys_)) return;
+
+		this.masterKeys_ = v;
+	}
+
+	public get noteLockKey(): MasterKeyEntity {
+		return this.noteLockKey_;
+	}
+
+	public set noteLockKey(v: MasterKeyEntity) {
+		if (JSON.stringify(v) === JSON.stringify(this.noteLockKey_)) return;
+
+		this.noteLockKey_ = v;
+	}
+
+	// Identifies the note lock key lineage: created with the first key, kept through password resets and
+	// replaced only when the user migrates to a sync target's key.
+	public get syncMigrationId(): string {
+		return this.syncMigrationId_;
+	}
+
+	public set syncMigrationId(v: string) {
+		this.syncMigrationId_ = v;
+	}
+
+	public keyTimestamp(name: string): number {
+		const self = this as unknown as Record<string, { updatedTime: number }>;
+		if (!(`${name}_` in self)) throw new Error(`Invalid name: ${name}`);
+		return self[`${name}_`].updatedTime;
+	}
+
+	public setKeyTimestamp(name: string, timestamp: number) {
+		const self = this as unknown as Record<string, { updatedTime: number }>;
+		if (!(`${name}_` in self)) throw new Error(`Invalid name: ${name}`);
+		self[`${name}_`].updatedTime = timestamp;
+	}
+}
+
+// ---------------------------------------------------------
+// Shortcuts to simplify the refactoring
+// ---------------------------------------------------------
+
+export function getEncryptionEnabled() {
+	return localSyncInfo().e2ee;
+}
+
+export function setEncryptionEnabled(v: boolean, activeMasterKeyId = '') {
+	const s = localSyncInfo();
+	s.e2ee = v;
+	if (activeMasterKeyId) s.activeMasterKeyId = activeMasterKeyId;
+	saveLocalSyncInfo(s);
+}
+
+export function getActiveMasterKeyId() {
+	return localSyncInfo().activeMasterKeyId;
+}
+
+export function setActiveMasterKeyId(id: string) {
+	const s = localSyncInfo();
+	s.activeMasterKeyId = id;
+	saveLocalSyncInfo(s);
+}
+
+export function getActiveMasterKey(s: SyncInfo = null): MasterKeyEntity | null {
+	s = s || localSyncInfo();
+	if (!s.activeMasterKeyId) return null;
+	return s.masterKeys.find(mk => mk.id === s.activeMasterKeyId);
+}
+
+export function setMasterKeyEnabled(mkId: string, enabled = true) {
+	const s = localSyncInfo();
+	const idx = s.masterKeys.findIndex(mk => mk.id === mkId);
+	if (idx < 0) throw new Error(`No such master key: ${mkId}`);
+
+	// Disabled for now as it's needed to disable even the main master key when the password has been forgotten
+	// https://discourse.joplinapp.org/t/syncing-error-with-joplin-cloud-and-e2ee-master-key-is-not-loaded/20115/5?u=laurent
+	//
+	// if (mkId === getActiveMasterKeyId() && !enabled) throw new Error('The active master key cannot be disabled');
+
+	s.masterKeys[idx] = {
+		...s.masterKeys[idx],
+		enabled: enabled ? 1 : 0,
+		updated_time: Date.now(),
+	};
+
+	saveLocalSyncInfo(s);
+}
+
+export const setMasterKeyHasBeenUsed = (s: SyncInfo, mkId: string) => {
+	const idx = s.masterKeys.findIndex(mk => mk.id === mkId);
+	if (idx < 0) throw new Error(`No such master key: ${mkId}`);
+	if (s.masterKeys[idx].hasBeenUsed) return s;
+
+	s.masterKeys[idx] = {
+		...s.masterKeys[idx],
+		hasBeenUsed: true,
+		updated_time: Date.now(),
+	};
+
+	// Saved by the caller with the rest of the merge, so the sync never persists a candidate its checks may still reject.
+	return s;
+};
+
+export function masterKeyEnabled(mk: MasterKeyEntity): boolean {
+	if ('enabled' in mk) return !!mk.enabled;
+	return true;
+}
+
+export function addMasterKey(syncInfo: SyncInfo, masterKey: MasterKeyEntity) {
+	// Sanity check - because shouldn't happen
+	if (syncInfo.masterKeys.find(mk => mk.id === masterKey.id)) throw new Error('Master key is already present');
+
+	syncInfo.masterKeys.push(masterKey);
+	saveLocalSyncInfo(syncInfo);
+}
+
+export function setPpk(ppk: PublicPrivateKeyPair) {
+	const syncInfo = localSyncInfo();
+	syncInfo.ppk = ppk;
+	saveLocalSyncInfo(syncInfo);
+}
+
+export function masterKeyById(id: string) {
+	return localSyncInfo().masterKeys.find(mk => mk.id === id);
+}
+
+const noteLockKeyConflictSettingKey = 'noteLock.conflictNoteLockKey';
+
+export const noteLockKeyConflict = (): NoteLockKeyConflict | null => {
+	const conflict = Setting.value(noteLockKeyConflictSettingKey) as Partial<NoteLockKeyConflict>;
+	return conflict.noteLockKey ? conflict as NoteLockKeyConflict : null;
+};
+
+export const noteLockKeyConflictFromState = (state: State) => {
+	return isNoteLockEnabled() && !!(state.settings[noteLockKeyConflictSettingKey] as Partial<NoteLockKeyConflict>)?.noteLockKey;
+};
+
+// Replaces the local key and lineage with the sync target's, so callers migrate first or warn: notes still locked
+// with the local key become unreadable. A pending reset belonged to the dropped lineage, so it is cleared too.
+export const adoptNoteLockKeyConflict = () => {
+	const conflict = noteLockKeyConflict();
+	if (!conflict) throw new Error('No note lock key conflict to adopt');
+	const syncInfo = localSyncInfo();
+	syncInfo.noteLockKey = conflict.noteLockKey;
+	syncInfo.syncMigrationId = conflict.syncMigrationId;
+	saveLocalSyncInfo(syncInfo);
+	Setting.setValue(noteLockKeyConflictSettingKey, {});
+	Setting.setValue('noteLock.passwordReset', false);
+	Setting.setValue('noteLock.keyIdToReset', '');
+};
+
+// Different lineages with local notes depending on the local key stop the sync: the remote key is parked for the
+// migration and keeps rejecting syncs until resolved. A stale reset (another device reset first) counts as a different lineage.
+// A parked key is checked again against the current target, for example after switching to another sync target, unless a
+// migration is running or has already moved notes to it (parkedKeyInUse), since those notes need it.
+export const checkNoteLockKeyConflict = (local: SyncInfo, remote: SyncInfo, hasLocalLockedNotes: boolean, staleReset: boolean, parkedKeyInUse = false) => {
+	const parked = noteLockKeyConflict();
+	if (!parked || !parkedKeyInUse) {
+		const keysDiffer = !!local.noteLockKey && !!remote.noteLockKey && local.noteLockKey.id !== remote.noteLockKey.id;
+		// The scenarios where a conflict occurs are when a different device has set up note lock for the first time (noteLockKey
+		// and syncMigrationId both differ) and when both remote and local have reset the password at the point of syncing (which
+		// makes staleReset true). staleReset is false both when a local password reset should propagate and when only a remote
+		// password reset was made (which silently accepts the remote key), and syncMigrationId is what tells a password reset
+		// apart from a key created for the first time.
+		if (!keysDiffer || (local.syncMigrationId === remote.syncMigrationId && !staleReset) || !hasLocalLockedNotes) {
+			if (parked) Setting.setValue(noteLockKeyConflictSettingKey, {});
+			return;
+		}
+		const conflict: NoteLockKeyConflict = { noteLockKey: remote.noteLockKey, syncMigrationId: remote.syncMigrationId };
+		if (!parked || parked.syncMigrationId !== conflict.syncMigrationId || parked.noteLockKey.id !== conflict.noteLockKey.id || parked.noteLockKey.updated_time !== conflict.noteLockKey.updated_time) {
+			Setting.setValue(noteLockKeyConflictSettingKey, conflict);
+		}
+	}
+	throw new JoplinError(isNoteLockEnabled()
+		? _('Synchronisation was stopped because the sync target uses a different note lock key to the one on your device. Your locked notes must be migrated to the synced key before synchronisation can continue.')
+		: _('Synchronisation was stopped because a note lock key migration is required. Enable the note lock feature to migrate your locked notes.'), ErrorCode.NoteLockKeyConflict);
+};
+
+const sameNoteLockKey = (a: SyncInfo, b: SyncInfo) => {
+	return a.noteLockKey?.id === b.noteLockKey?.id && a.noteLockKey?.updated_time === b.noteLockKey?.updated_time && a.syncMigrationId === b.syncMigrationId;
+};
+
+// A reset, password change or migration that lands while a sync is in flight would be clobbered by the sync's
+// local save, so the sync stops instead and the next one starts from the new state.
+export const checkNoteLockKeyUnchanged = (snapshot: SyncInfo) => {
+	if (sameNoteLockKey(localSyncInfo(), snapshot)) return;
+	throw new Error(_('Synchronisation was stopped because the note lock key changed on this device during the sync. Please synchronise again.'));
+};
+
+export const checkRemoteNoteLockKeyUnchanged = (fetched: SyncInfo, latest: SyncInfo) => {
+	if (sameNoteLockKey(fetched, latest)) return;
+	throw new Error(_('Synchronisation was stopped because the note lock key on the sync target changed during the sync. Please synchronise again.'));
+};
+
+// Sync migration ids predate the release of the note lock feature, so a key without one comes from a
+// development build and cannot take part in the reset and migration handling.
+export const checkNoteLockKeyMigrationId = (s: SyncInfo, isRemote: boolean) => {
+	if (!s.noteLockKey || s.syncMigrationId) return;
+	throw new Error(isRemote
+		? _('Synchronisation was stopped because the note lock key on the sync target has no sync migration ID.')
+		: _('Synchronisation was stopped because the note lock key on this device has no sync migration ID. Please reset the note lock password.'));
+};
+
+export const checkIfCanSync = (s: SyncInfo, appVersion: string) => {
+	const isForwardCompatible = () => {
+		// Forward compatibility: This version of Joplin supports the Joplin 3.7 sync target format
+		if (s.appMinVersion !== forwardCompatibleAppMinVersion) return false;
+		// Older Joplin versions don't support sync targets with locked notes
+		if (s.noteLockKey !== null) return false;
+		return true;
+	};
+
+	if (compareVersions(appVersion, s.appMinVersion) < 0 && !isForwardCompatible()) {
+		throw new JoplinError(_('In order to synchronise, please upgrade your application to version %s+', s.appMinVersion), ErrorCode.MustUpgradeApp, s.appMinVersion);
+	}
+};

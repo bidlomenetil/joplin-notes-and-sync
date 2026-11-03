@@ -1,0 +1,8 @@
+{
+  "name": "Joplin",
+  "displayName": "Joplin",
+  "plugins": [
+    "@react-native-community/datetimepicker",
+    "expo-audio"
+  ]
+}
